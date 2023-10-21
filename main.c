@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <signal.h>
 #include <sys/types.h>
@@ -10,6 +11,22 @@
 #define MAX_COMMANDS 30
 #define MAX_COMMAND_LENGTH 1024
 #define MAX_ARGS 30
+
+// construct a struct to store the extracted fields
+struct process_stat {
+    int pid;
+    char cmd[256];
+    char state;
+    int excode;
+    char exsig[256];
+    int ppid;
+    unsigned long user;
+    unsigned long sys;
+    unsigned long vctx;
+    unsigned long nvctx;
+    long long total_time;
+    bool termBySig;
+};
 
 volatile sig_atomic_t interrupted = 0; // Flag to indicate if SIGINT was received
 
@@ -40,8 +57,10 @@ void execute_command(char *command) {
     exit(1);
 }
 
-void print_process_statistics(pid_t pid, siginfo_t si) {
+struct process_stat get_process_statistics(pid_t pid, siginfo_t si) {
     // reference: https://man7.org/linux/man-pages/man5/proc.5.html
+    
+    struct process_stat process_info;
 
     char stat_filepath[256];
     char status_filepath[256];
@@ -51,7 +70,9 @@ void print_process_statistics(pid_t pid, siginfo_t si) {
     char cmd[256], state, exsig[256];  // exsig is the string representation of si.si_status
     int excode, ppid;
     unsigned long user, sys;
+    long cutime, cstime;
     unsigned long vctx, nvctx;
+    unsigned long long start_time, total_time;
 
     // Construct the file paths for the stat and status files
     snprintf(stat_filepath, sizeof(stat_filepath), "/proc/%d/stat", pid);
@@ -62,7 +83,7 @@ void print_process_statistics(pid_t pid, siginfo_t si) {
     if (stat_file == NULL) {
         // report error
         fprintf(stderr, "JCshell: Error opening stat file\n");
-        return;
+        return process_info;
     }
     // Read and print process statistics
     char stat_line[2048];  // Adjust buffer size as needed
@@ -94,7 +115,13 @@ void print_process_statistics(pid_t pid, siginfo_t si) {
             user = atol(token);
         } else if (field == 15) {
             sys = atol(token);
-        } 
+        } else if (field == 16) {
+            cutime = atol(token);
+        } else if (field == 17) {
+            cstime = atol(token);
+        } else if (field == 22) {
+            start_time = atol(token);
+        }
         token = strtok(NULL, " ");
         field++;
     }
@@ -103,7 +130,7 @@ void print_process_statistics(pid_t pid, siginfo_t si) {
     if (status_file == NULL) {
         // report error
         fprintf(stderr, "JCshell: Error opening status file\n");
-        return;
+        return process_info;
     }
     // Read and print process statistics
     char status_line[2048];  // Adjust buffer size as needed
@@ -133,37 +160,33 @@ void print_process_statistics(pid_t pid, siginfo_t si) {
         // note that reverting the order of the if statements will cause incorrect output
     }
 
+    // total_time: termination time of the process
+    total_time = start_time + user + sys + cutime + cstime;
+    // printf("total_time: %lld, start_time: %lld, user: %lu, sys: %lu, cutime: %lu, cstime: %lu\n", total_time, start_time, user, sys, cutime, cstime);
     char * signal_name = strsignal(si.si_status);
     // store signal name in exsig
     strcpy(exsig, signal_name);
 
+    // save the extracted fields to struct in oneline
+    process_info = (struct process_stat){extracted_pid, " ", state, excode, " ", ppid, user, sys, vctx, nvctx, total_time, 0};
+    strcpy(process_info.cmd, cmd);
+    strcpy(process_info.exsig, exsig);
 
-    // sscanf(stat_line, "%d %s %c %d %d %d %lu %lu %*d %*d %lu %lu",
-    //        &extracted_pid, cmd, &state, &excode, &exsig, &ppid, &user, &sys, &vctx, &nvctx);
-
-    // if excode is not 0/1, print EXSIG instead
-    if (excode != 0 && excode != 1) {
-        printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n",
-           extracted_pid, cmd, state, exsig, ppid,
-           (double)user / sysconf(_SC_CLK_TCK), (double)sys / sysconf(_SC_CLK_TCK), vctx, nvctx);
-    } else {
-        printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n",
-           extracted_pid, cmd, state, excode, ppid,
-           (double)user / sysconf(_SC_CLK_TCK), (double)sys / sysconf(_SC_CLK_TCK), vctx, nvctx);
-    }
+    return process_info;
 
 }
 
 
 void execute_job(char *commands[], int num_commands) {
     int pipefd[MAX_COMMANDS - 1][2];
+    int num_pipefds = num_commands - 1;
 
     // printf("num_commands: %d\n", num_commands);
 
     // Create pipes for inter-process communication
     for (int i = 0; i < num_commands - 1; i++) {
         if (pipe(pipefd[i]) == -1) {
-            perror("Failure creating pipe");
+            fprintf(stderr, "JCshell: Failure creating pipe\n");
             exit(1);
         }
     }
@@ -172,41 +195,43 @@ void execute_job(char *commands[], int num_commands) {
     pid_t child_pids[MAX_COMMANDS];
 
     // Fork child processes for each command
-    for (int i = 0; i < num_commands; i++) {
+    for (int i = 0; i < num_commands; i++) {    // i: command index
         // printf("Ready to fork child process: %d\n", getpid());
         pid_t pid = fork();
 
         if (pid < 0) {
-            perror("Error forking process");
+            fprintf(stderr, "JCshell: Error forking process\n");
             exit(1);
         } else if (pid == 0) {
             // printf("Child process: %d\n", getpid());
             // Child process
 
-            // Redirect input from previous command (if not the first command)
-            if (i > 0) {
-                close(pipefd[i - 1][1]);
-                dup2(pipefd[i - 1][0], STDIN_FILENO);
-            }
-            else { // (i == 0)
-                // close all pipefds except pipefd[0][1]
-                for (int j = 1; j < num_commands - 1; j++) {
-                    close(pipefd[j][0]);
-                    close(pipefd[j][1]);
-                }
-            }
-            // Redirect output to next command (if not the last command)
-            if (i < num_commands - 1) {
-                close(pipefd[i][0]);
-                dup2(pipefd[i][1], STDOUT_FILENO);
-            } else { // last command
-                // close all pipefds except pipefd[i][0]
-                for (int j = 0; j < num_commands - 2; j++) {
-                    close(pipefd[j][0]);
-                    close(pipefd[j][1]);
+            for (int k = 0; k < num_pipefds; k++) { // k: pipefd index
+                // Logic: remove all except pfd[i-1][0] (stdin), and pfd[i][1] (stdout)
+                //          if i == 0, remove pfd[i-1][0] as well
+                //          if i == num_pipefds, remove pfd[i][1] as well
+                if (i == 0 && k == 0) {                                  // first
+                    close(pipefd[k][0]);
+                    dup2(pipefd[k][1], STDOUT_FILENO);
+                } else if (i == num_commands-1 && k == num_pipefds-1) {  // last
+                    close(pipefd[k][1]);
+                    dup2(pipefd[k][0], STDIN_FILENO);
+                } else {                                                 // middle
+                    if (i-1 == k) {
+                        close(pipefd[k][1]);
+                        dup2(pipefd[k][0], STDIN_FILENO);
+                    } else if (i == k) {
+                        close(pipefd[k][0]);
+                        dup2(pipefd[k][1], STDOUT_FILENO);
+                    } else {
+                        close(pipefd[k][0]);
+                        close(pipefd[k][1]);
+                    }
                 }
             }
             
+            // Print the command 
+            // printf("Executing command: %s\n", commands[i]);
             // Execute the command
             execute_command(commands[i]);
         } else {
@@ -227,12 +252,43 @@ void execute_job(char *commands[], int num_commands) {
     for (int i = 0; i < num_commands; i++) {
         waitid(P_PID, child_pids[i], &si[i], WNOWAIT | WEXITED);
     }
+
+    // a struct array to store the stats
+    struct process_stat stat_arr[num_commands];
+    for (int i = 0; i < num_commands; i++) {
+        stat_arr[i] = get_process_statistics(child_pids[i], si[i]);
+
+        // Clear the zombie status
+        int status;
+        waitpid(child_pids[i], &status, 0);
+
+        if (WIFSIGNALED(status)){
+            // printf("-----> Child process %d terminated by signal %d\n", child_pids[i], WTERMSIG(status));
+            stat_arr[i].termBySig = true;
+        } else { stat_arr[i].termBySig = false; }
+
+    }
+
+    // Sort stat_arr by total_time
+    for (int j = 0; j < num_commands; j++) {
+        for (int k = j+1; k < num_commands; k++) {
+            if (stat_arr[j].total_time > stat_arr[k].total_time) {
+                struct process_stat temp = stat_arr[j];
+                stat_arr[j] = stat_arr[k];
+                stat_arr[k] = temp;
+            }
+        }
+    }   // bubble sort
+
     // print stats in termination order
     printf("\n");
-    for (int i = num_commands-1; i >= 0; i--) {
-        print_process_statistics(child_pids[i], si[i]);
-        // Clear the zombie status
-        waitpid(child_pids[i], NULL, 0);
+    for (int i = 0; i < num_commands; i++) {
+        if (stat_arr[i].termBySig) {    // process is terminated by signal
+            printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%lu (SYS)%lu (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
+        } else {
+            printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%lu (SYS)%lu (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
+        }
+        // printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (EXSIG)%s (PPID)%d (USER)%lu (SYS)%lu (VCTX)%lu (NVCTX)%lu (Total_ime)%lld (termBySig)%d\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx, stat_arr[i].total_time, stat_arr[i].termBySig);
     }
 }
 
@@ -286,8 +342,8 @@ int main() {
         } else if (interrupted) {
             // SIGINT was received
             // printf("\nIn main: interrupted: %d\n", interrupted);
-            printf("\n");
             interrupted = 0; // Reset the interrupted flag
+            printf("\n");
             continue;
         }
 
