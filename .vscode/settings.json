@@ -1,0 +1,10 @@
+{
+  "C_Cpp.intelliSenseEngineFallback": "enabled",
+  "files.associations": {
+    "cerrno": "c"
+  },
+  "code-runner.executorMap": {
+         //*
+        "c": "cd $dir && gcc -pedantic-errors -std=c11 $fileName -o $fileNameWithoutExt -D_POSIX_C_SOURCE=200809L && time $dir$fileNameWithoutExt",
+  },
+}
