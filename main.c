@@ -22,18 +22,26 @@ struct process_stat {
     int ppid;
     unsigned long user;
     unsigned long sys;
+    // double user;
+    // double sys;
     unsigned long vctx;
     unsigned long nvctx;
     long long total_time;
     bool termBySig;
 };
 
-volatile sig_atomic_t interrupted = 0; // Flag to indicate if SIGINT was received
+volatile sig_atomic_t sigusr1_received = 0;
 
 void sigint_handler1(int signum) {
-    interrupted = 1;
+    printf("\n## JCshell [%d] ## ", getpid());
+    // flush the stdout buffer
+    fflush(stdout);
     // printf("\nJCshell: SIGINT (Ctrl-C) received.\n");
 }
+void sigusr1_handler(int signum) {
+    sigusr1_received = 1;
+}
+
 
 void execute_command(char *command) {
     char *args[MAX_ARGS];
@@ -71,6 +79,7 @@ struct process_stat get_process_statistics(pid_t pid, siginfo_t si) {
     int excode, ppid;
     unsigned long user, sys;
     long cutime, cstime;
+    // double user, sys, cutime, cstime, start_time, total_time;
     unsigned long vctx, nvctx;
     unsigned long long start_time, total_time;
 
@@ -113,14 +122,19 @@ struct process_stat get_process_statistics(pid_t pid, siginfo_t si) {
             excode = atoi(token);
         } else if (field == 14) {
             user = atol(token);
+            // double user_ = atof(token) / sysconf(_SC_CLK_TCK);
         } else if (field == 15) {
             sys = atol(token);
+            // sys = atof(token) / sysconf(_SC_CLK_TCK);
         } else if (field == 16) {
             cutime = atol(token);
+            // cutime = atof(token) / sysconf(_SC_CLK_TCK);
         } else if (field == 17) {
             cstime = atol(token);
+            // cstime = atof(token) / sysconf(_SC_CLK_TCK);
         } else if (field == 22) {
             start_time = atol(token);
+            // start_time = atof(token) / sysconf(_SC_CLK_TCK);
         }
         token = strtok(NULL, " ");
         field++;
@@ -163,6 +177,7 @@ struct process_stat get_process_statistics(pid_t pid, siginfo_t si) {
     // total_time: termination time of the process
     total_time = start_time + user + sys + cutime + cstime;
     // printf("total_time: %lld, start_time: %lld, user: %lu, sys: %lu, cutime: %lu, cstime: %lu\n", total_time, start_time, user, sys, cutime, cstime);
+    // printf("total_time: %f, start_time: %f, user: %f, sys: %f, cutime: %f, cstime: %f\n", total_time, start_time, user, sys, cutime, cstime);
     char * signal_name = strsignal(si.si_status);
     // store signal name in exsig
     strcpy(exsig, signal_name);
@@ -203,8 +218,37 @@ void execute_job(char *commands[], int num_commands) {
             fprintf(stderr, "JCshell: Error forking process\n");
             exit(1);
         } else if (pid == 0) {
-            // printf("Child process: %d\n", getpid());
             // Child process
+            // printf("Child process: %d\n", getpid());
+
+            sigset_t set;
+            int sig;
+            // Initialize a signal set containing SIGUSR1
+            sigemptyset(&set);
+            sigaddset(&set, SIGUSR1);
+            // Block the signals in the set (prevent the signal from being delivered to the process)
+            sigprocmask(SIG_BLOCK, &set, NULL);
+
+            // Set the handler for SIGUSR1
+            struct sigaction sa;
+            sigaction(SIGUSR1, NULL, &sa);
+            sa.sa_handler = sigusr1_handler;
+            sigaction(SIGUSR1, &sa, NULL);
+
+            // Wait for SIGUSR1 to be received
+            // printf("Waiting for SIGUSR1...\n");
+            if (sigwait(&set, &sig) == -1) {
+                perror("sigwait");
+                exit(EXIT_FAILURE);
+            }
+
+            // Install the SIGINT handler
+            // struct sigaction sa;
+            // sigaction(SIGINT, NULL, &sa);
+            // sa.sa_handler = SIG_DFL;
+            // sigaction(SIGINT, &sa, NULL);
+            signal(SIGINT, SIG_DFL);
+
 
             for (int k = 0; k < num_pipefds; k++) { // k: pipefd index
                 // Logic: remove all except pfd[i-1][0] (stdin), and pfd[i][1] (stdout)
@@ -237,8 +281,17 @@ void execute_job(char *commands[], int num_commands) {
         } else {
             // Parent process
             // printf("Parent process: %d\n", getpid());
+            signal(SIGINT, SIG_IGN);
             child_pids[i] = pid;
         }
+        // here, the parent process will continue to fork the next child process
+    }
+
+    // Send SIGUSR1 to wake up child processes when ready
+    sleep(0.85);
+    for (int i = 0; i < num_commands; i++) {
+        // printf("Sending SIGUSR1 to child process %d\n", child_pids[i]);
+        kill(child_pids[i], SIGUSR1);
     }
 
     // Close all pipes in the parent process
@@ -258,10 +311,10 @@ void execute_job(char *commands[], int num_commands) {
     for (int i = 0; i < num_commands; i++) {
         stat_arr[i] = get_process_statistics(child_pids[i], si[i]);
 
-        // Clear the zombie status
+        // Clear the zombie status and extract status and 
         int status;
         waitpid(child_pids[i], &status, 0);
-
+        stat_arr[i].excode = WEXITSTATUS(status);   // (why doesn't match with /proc/<pid>/stat field 52?)
         if (WIFSIGNALED(status)){
             // printf("-----> Child process %d terminated by signal %d\n", child_pids[i], WTERMSIG(status));
             stat_arr[i].termBySig = true;
@@ -284,8 +337,10 @@ void execute_job(char *commands[], int num_commands) {
     printf("\n");
     for (int i = 0; i < num_commands; i++) {
         if (stat_arr[i].termBySig) {    // process is terminated by signal
+            // printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%f (SYS)%f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
             printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%lu (SYS)%lu (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
         } else {
+            // printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%f (SYS)%f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
             printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%lu (SYS)%lu (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
         }
         // printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (EXSIG)%s (PPID)%d (USER)%lu (SYS)%lu (VCTX)%lu (NVCTX)%lu (Total_ime)%lld (termBySig)%d\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx, stat_arr[i].total_time, stat_arr[i].termBySig);
@@ -325,27 +380,21 @@ int main() {
     char input[MAX_COMMAND_LENGTH];
 
     // Install the SIGINT handler
-    struct sigaction sa;
-    sigaction(SIGINT, NULL, &sa);
-    sa.sa_handler = sigint_handler1;
-    sigaction(SIGINT, &sa, NULL);
+    // struct sigaction sa;
+    // sigaction(SIGINT, NULL, &sa);
+    // sa.sa_handler = sigint_handler1;
+    // sigaction(SIGINT, &sa, NULL);
 
     while (1) {
+        signal(SIGINT, sigint_handler1);
+
         // Print shell prompt with process ID
         printf("## JCshell [%d] ## ", getpid());
 
         // Read user input
-        if (fgets(input, sizeof(input), stdin) == NULL && ! interrupted) {
-            // End of input (e.g., EOF or error)
-            printf("\nEOF or error\n");
-            break;
-        } else if (interrupted) {
-            // SIGINT was received
-            // printf("\nIn main: interrupted: %d\n", interrupted);
-            interrupted = 0; // Reset the interrupted flag
-            printf("\n");
-            continue;
-        }
+        fgets(input, sizeof(input), stdin);
+        // flush the stdin buffer
+        fflush(stdin);
 
         // Convert trailing newline character to NULL character
         int input_length = (int)strcspn(input, "\n");
