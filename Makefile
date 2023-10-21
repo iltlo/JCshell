@@ -1,7 +1,9 @@
 CC=gcc
-EXE=main
+EXE=main ./utility/tloop ./utility/segfault ./utility/forever
 
-main: main.o
+all: $(EXE)
+
+main: main.c
 	$(CC) $< -o $@
 
 clean:

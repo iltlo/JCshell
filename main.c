@@ -11,6 +11,13 @@
 #define MAX_COMMAND_LENGTH 1024
 #define MAX_ARGS 30
 
+volatile sig_atomic_t interrupted = 0; // Flag to indicate if SIGINT was received
+
+void sigint_handler1(int signum) {
+    interrupted = 1;
+    // printf("\nJCshell: SIGINT (Ctrl-C) received.\n");
+}
+
 void execute_command(char *command) {
     char *args[MAX_ARGS];
     int arg_count = 0;
@@ -33,7 +40,7 @@ void execute_command(char *command) {
     exit(1);
 }
 
-void print_process_statistics(pid_t pid) {
+void print_process_statistics(pid_t pid, siginfo_t si) {
     // reference: https://man7.org/linux/man-pages/man5/proc.5.html
 
     char stat_filepath[256];
@@ -41,8 +48,8 @@ void print_process_statistics(pid_t pid) {
 
     // Parse and extract fields from the stat line
     int extracted_pid;
-    char cmd[256], state;
-    int excode, exsig, ppid;
+    char cmd[256], state, exsig[256];  // exsig is the string representation of si.si_status
+    int excode, ppid;
     unsigned long user, sys;
     unsigned long vctx, nvctx;
 
@@ -126,13 +133,25 @@ void print_process_statistics(pid_t pid) {
         // note that reverting the order of the if statements will cause incorrect output
     }
 
-    sscanf(stat_line, "%d %s %c %d %d %d %lu %lu %*d %*d %lu %lu",
-           &extracted_pid, cmd, &state, &excode, &exsig, &ppid, &user, &sys, &vctx, &nvctx);
+    char * signal_name = strsignal(si.si_status);
+    // store signal name in exsig
+    strcpy(exsig, signal_name);
 
-    // Print the extracted fields in the specified format
-    printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (EXSIG)%d (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n",
-           extracted_pid, cmd, state, excode, exsig, ppid,
+
+    // sscanf(stat_line, "%d %s %c %d %d %d %lu %lu %*d %*d %lu %lu",
+    //        &extracted_pid, cmd, &state, &excode, &exsig, &ppid, &user, &sys, &vctx, &nvctx);
+
+    // if excode is not 0/1, print EXSIG instead
+    if (excode != 0 && excode != 1) {
+        printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n",
+           extracted_pid, cmd, state, exsig, ppid,
            (double)user / sysconf(_SC_CLK_TCK), (double)sys / sysconf(_SC_CLK_TCK), vctx, nvctx);
+    } else {
+        printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n",
+           extracted_pid, cmd, state, excode, ppid,
+           (double)user / sysconf(_SC_CLK_TCK), (double)sys / sysconf(_SC_CLK_TCK), vctx, nvctx);
+    }
+
 }
 
 
@@ -151,6 +170,7 @@ void execute_job(char *commands[], int num_commands) {
 
     // Create an array to store child process PIDs
     pid_t child_pids[MAX_COMMANDS];
+
     // Fork child processes for each command
     for (int i = 0; i < num_commands; i++) {
         // printf("Ready to fork child process: %d\n", getpid());
@@ -202,18 +222,15 @@ void execute_job(char *commands[], int num_commands) {
         close(pipefd[i][1]);
     }
 
-    // Wait for all child processes to terminate and print their statistics
-    // TODO: fix print stat after all child terminates
+    // Wait for all child processes to terminate
+    siginfo_t si[num_commands];
     for (int i = 0; i < num_commands; i++) {
-        siginfo_t si;
-        // waitid(P_PID, child_pids[i], &si, WNOWAIT | WEXITED);
-        waitid(P_PID, child_pids[i], &si, WNOWAIT | WEXITED);
-
-        print_process_statistics(child_pids[i]);
-        // Extract terminating signal name
-        char * signal_name = strsignal(si.si_status);
-        printf("(SIGNAL)%s\n", signal_name);
-        
+        waitid(P_PID, child_pids[i], &si[i], WNOWAIT | WEXITED);
+    }
+    // print stats in termination order
+    printf("\n");
+    for (int i = num_commands-1; i >= 0; i--) {
+        print_process_statistics(child_pids[i], si[i]);
         // Clear the zombie status
         waitpid(child_pids[i], NULL, 0);
     }
@@ -221,16 +238,20 @@ void execute_job(char *commands[], int num_commands) {
 
 // Return error codes or messages:
 // 0: Valid input
-// 1: Two consecutive pipes
-// 2: Pipe at the beginning
-// 3: Pipe at the end
+// 1: Empty input
+// 2: Two consecutive pipes
+// 3: Pipe at the beginning
+// 4: Pipe at the end
 int validate_input(const char *input) {
-    if (strstr(input, "||") != NULL) {
-        return 1;  // Two consecutive pipes
+    if (strlen(input) == 0 || strspn(input, " ") == strlen(input)) {
+        // if input is empty or only spaces
+        return 1;
+    } else if (strstr(input, "||") != NULL) {
+        return 2;  // Two consecutive pipes
     } else if (input[0] == '|') {
-        return 2;  // Pipe at the beginning
+        return 3;  // Pipe at the beginning
     } else if (input[strlen(input) - 1] == '|') {
-        return 3;  // Pipe at the end
+        return 4;  // Pipe at the end
     }
     return 0;  // Valid input
 }
@@ -247,14 +268,27 @@ void print_cmds(char * arr[], int size) {
 int main() {
     char input[MAX_COMMAND_LENGTH];
 
+    // Install the SIGINT handler
+    struct sigaction sa;
+    sigaction(SIGINT, NULL, &sa);
+    sa.sa_handler = sigint_handler1;
+    sigaction(SIGINT, &sa, NULL);
+
     while (1) {
         // Print shell prompt with process ID
         printf("## JCshell [%d] ## ", getpid());
 
         // Read user input
-        if (fgets(input, sizeof(input), stdin) == NULL) {
+        if (fgets(input, sizeof(input), stdin) == NULL && ! interrupted) {
             // End of input (e.g., EOF or error)
+            printf("\nEOF or error\n");
             break;
+        } else if (interrupted) {
+            // SIGINT was received
+            // printf("\nIn main: interrupted: %d\n", interrupted);
+            printf("\n");
+            interrupted = 0; // Reset the interrupted flag
+            continue;
         }
 
         // Convert trailing newline character to NULL character
@@ -283,12 +317,15 @@ int main() {
         // Validate input for consecutive pipes and pipes at the beginning or end
         int error_code = validate_input(input);
         if (error_code == 1) {
-            fprintf(stderr, "JCshell: should not have two | symbols without in-between command\n");
+            // fprintf(stderr, "JCshell: should not have empty input\n");
             continue;
         } else if (error_code == 2) {
-            fprintf(stderr, "JCshell: should not have a | symbol at the beginning of the command\n");
+            fprintf(stderr, "JCshell: should not have two | symbols without in-between command\n");
             continue;
         } else if (error_code == 3) {
+            fprintf(stderr, "JCshell: should not have a | symbol at the beginning of the command\n");
+            continue;
+        } else if (error_code == 4) {
             fprintf(stderr, "JCshell: should not have a | symbol at the end of the command\n");
             continue;
         }
