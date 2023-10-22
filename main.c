@@ -42,9 +42,8 @@ void sigusr1_handler(int signum) {
     sigusr1_received = 1;
 }
 
+/* reference: https://man7.org/linux/man-pages/man5/proc.5.html */
 ProcessStat get_process_stat(pid_t pid, siginfo_t si) {
-    // reference: https://man7.org/linux/man-pages/man5/proc.5.html
-    
     ProcessStat process_info;
 
     char stat_filepath[256];
@@ -146,14 +145,14 @@ ProcessStat get_process_stat(pid_t pid, siginfo_t si) {
 
     // total_time: termination time of the process
     total_time = start_time + user + sys + cutime + cstime;
-    // printf("total_time: %f, start_time: %f, user: %f, sys: %f, cutime: %f, cstime: %f\n", total_time, start_time, user, sys, cutime, cstime);
 
     char * signal_name = strsignal(si.si_status);
     // store signal name in exsig
     strcpy(exsig, signal_name);
 
     // save the extracted fields to struct in oneline
-    process_info = (ProcessStat){extracted_pid, " ", state, excode, " ", ppid, user, sys, vctx, nvctx, total_time, 0};
+    process_info = (ProcessStat){extracted_pid, " ", state, excode, " ", ppid, 
+                                    user, sys, vctx, nvctx, total_time, 0};
     strcpy(process_info.cmd, cmd);
     strcpy(process_info.exsig, exsig);
 
@@ -281,7 +280,6 @@ void execute_job(char *commands[], int num_commands) {
 
 /* Function to extract and print the stat, and remove process zombie state */
 void extract_stat(int num_commands, pid_t child_pids[], siginfo_t si[]) {
-
     // a struct array to store the stats
     ProcessStat stat_arr[num_commands];
     for (int i = 0; i < num_commands; i++) {
@@ -312,11 +310,14 @@ void extract_stat(int num_commands, pid_t child_pids[], siginfo_t si[]) {
     for (int i = 0; i < num_commands; i++) {
         // Print EXSIG if the process is terminated by signal, otherwise print EXCODE
         if (stat_arr[i].termBySig) {    // Process is terminated by signal
-            printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
+            printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n", 
+                stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].exsig, stat_arr[i].ppid, 
+                    stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
         } else {
-            printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
+            printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n", 
+                stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].ppid, 
+                    stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
         }
-        // printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (EXSIG)%s (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu (Total_ime)%f (termBySig)%d\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx, stat_arr[i].total_time, stat_arr[i].termBySig);
     }
 }
 
@@ -329,7 +330,6 @@ void extract_stat(int num_commands, pid_t child_pids[], siginfo_t si[]) {
     5: Pipe at the beginning
     6: Pipe at the end */ 
 int validate_input(const char *input, int input_length) {
-
     // make a copy for input (to facilitate tokenization)
     char input_copy[MAX_COMMAND_LENGTH];
     strcpy(input_copy, input);
@@ -353,7 +353,6 @@ int validate_input(const char *input, int input_length) {
 
     // Check for empty input
     if (input_length == 0 || strspn(input, " ") == input_length) {
-        // if input is empty or only spaces
         // fprintf(stderr, "JCshell: should not have empty input\n");
         return 3;
     }
@@ -440,4 +439,3 @@ int main() {
 
     return 0;
 }
-

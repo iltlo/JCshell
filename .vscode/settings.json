@@ -1,7 +1,8 @@
 {
   "C_Cpp.intelliSenseEngineFallback": "enabled",
   "files.associations": {
-    "cerrno": "c"
+    "cerrno": "c",
+    "stdbool.h": "c"
   },
   "code-runner.executorMap": {
          //*
