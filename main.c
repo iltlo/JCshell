@@ -12,8 +12,10 @@
 #define MAX_COMMAND_LENGTH 1024
 #define MAX_ARGS 30
 
-// construct a struct to store the extracted fields
-struct process_stat {
+void extract_stat(int num_commands, pid_t child_pids[], siginfo_t si[]);
+
+// struct to store the process stat extracted fields
+typedef struct ProcessStat {
     int pid;
     char cmd[256];
     char state;
@@ -26,7 +28,7 @@ struct process_stat {
     unsigned long nvctx;
     double total_time;
     bool termBySig;
-};
+} ProcessStat;
 
 volatile sig_atomic_t sigusr1_received = 0;
 
@@ -40,33 +42,10 @@ void sigusr1_handler(int signum) {
     sigusr1_received = 1;
 }
 
-
-void execute_command(char *command) {
-    char *args[MAX_ARGS];
-    int arg_count = 0;
-
-    // Tokenize the command into arguments
-    char *token = strtok(command, " ");
-    while (token != NULL) {
-        args[arg_count++] = token;
-        token = strtok(NULL, " ");
-    }
-    args[arg_count] = NULL;
-
-    // Execute the command
-    if (execvp(args[0], args) == -1){
-        fprintf(stderr, "JCshell: '%s': ", args[0]);
-        perror("");
-    }
-
-    // If execvp returns (isnt replaced by the args[0] command), there was an error
-    exit(1);
-}
-
-struct process_stat get_process_statistics(pid_t pid, siginfo_t si) {
+ProcessStat get_process_stat(pid_t pid, siginfo_t si) {
     // reference: https://man7.org/linux/man-pages/man5/proc.5.html
     
-    struct process_stat process_info;
+    ProcessStat process_info;
 
     char stat_filepath[256];
     char status_filepath[256];
@@ -163,31 +142,55 @@ struct process_stat get_process_statistics(pid_t pid, siginfo_t si) {
         }
         // note that reverting the order of the if statements will cause incorrect output
     }
+    fclose(status_file);
 
     // total_time: termination time of the process
     total_time = start_time + user + sys + cutime + cstime;
     // printf("total_time: %f, start_time: %f, user: %f, sys: %f, cutime: %f, cstime: %f\n", total_time, start_time, user, sys, cutime, cstime);
+
     char * signal_name = strsignal(si.si_status);
     // store signal name in exsig
     strcpy(exsig, signal_name);
 
     // save the extracted fields to struct in oneline
-    process_info = (struct process_stat){extracted_pid, " ", state, excode, " ", ppid, user, sys, vctx, nvctx, total_time, 0};
+    process_info = (ProcessStat){extracted_pid, " ", state, excode, " ", ppid, user, sys, vctx, nvctx, total_time, 0};
     strcpy(process_info.cmd, cmd);
     strcpy(process_info.exsig, exsig);
 
     return process_info;
-
 }
 
+void execute_command(char *command) {
+    char *args[MAX_ARGS];
+    int arg_count = 0;
+
+    // Tokenize the command into arguments
+    char *token = strtok(command, " ");
+    while (token != NULL) {
+        args[arg_count++] = token;
+        token = strtok(NULL, " ");
+    }
+    args[arg_count] = NULL;
+
+    // Execute the command
+    if (execvp(args[0], args) == -1){
+        fprintf(stderr, "JCshell: '%s': ", args[0]);
+        perror("");
+    }
+
+    // If execvp returns (isnt replaced by the args[0] command), there was an error
+    exit(1);
+}
 
 void execute_job(char *commands[], int num_commands) {
     int pipefd[MAX_COMMANDS - 1][2];
     int num_pipefds = num_commands - 1;
 
     sigset_t orig_mask;
+    sigset_t set;
 
-    // printf("num_commands: %d\n", num_commands);
+    // Create an array to store child process PIDs
+    pid_t child_pids[MAX_COMMANDS];
 
     // Create pipes for inter-process communication
     for (int i = 0; i < num_commands - 1; i++) {
@@ -197,30 +200,23 @@ void execute_job(char *commands[], int num_commands) {
         }
     }
 
-    // Create an array to store child process PIDs
-    pid_t child_pids[MAX_COMMANDS];
-
     // Fork child processes for each command
     for (int i = 0; i < num_commands; i++) {    // i: command index
         signal(SIGUSR1, sigusr1_handler);
 
-        sigset_t set;
         // Initialize a signal set containing SIGUSR1
         sigemptyset(&set);
         sigaddset(&set, SIGUSR1);
         // Block the signals in the set (prevent the signal from being delivered to the process)
         sigprocmask(SIG_BLOCK, &set, &orig_mask);
         
-        // printf("Ready to fork child process: %d\n", getpid());
+        // Fork a child process
         pid_t pid = fork();
 
         if (pid < 0) {
             fprintf(stderr, "JCshell: Error forking process\n");
             exit(1);
-        } else if (pid == 0) {
-            // Child process
-            // printf("Child: process: %d\n", getpid());
-
+        } else if (pid == 0) {  // Child process
             sigset_t empty_mask;
             sigemptyset(&empty_mask);
 
@@ -230,46 +226,39 @@ void execute_job(char *commands[], int num_commands) {
             // Unblock SIGUSR1 for the child process
             sigprocmask(SIG_SETMASK, &orig_mask, NULL);
 
-
+            /*
+            Pipe Logic: for current cmd (i), remove all except pfd[i-1][0] (stdin), and pfd[i][1] (stdout)
+                        for first cmd (i == 0), pfd[i-1][0] index not valid
+                        for last cmd (i == num_pipefds), pfd[i][1] index not valid
+            Implementation (conditions):
+                        (i == num_commands-1 && k == num_pipefds-1) means the last command
+                        (i-1 == k) means the current pipe inputs to the current command
+                        (i == 0 && k == 0) means the first command
+                        (i == k) means the current pipe gets output from current command
+            */
             for (int k = 0; k < num_pipefds; k++) { // k: pipefd index
-                // Logic: remove all except pfd[i-1][0] (stdin), and pfd[i][1] (stdout)
-                //          if i == 0, remove pfd[i-1][0] as well
-                //          if i == num_pipefds, remove pfd[i][1] as well
-                if (i == 0 && k == 0) {                                  // first
-                    close(pipefd[k][0]);
-                    dup2(pipefd[k][1], STDOUT_FILENO);
-                } else if (i == num_commands-1 && k == num_pipefds-1) {  // last
+                if ((i == num_commands-1 && k == num_pipefds-1) || i-1 == k) {
                     close(pipefd[k][1]);
                     dup2(pipefd[k][0], STDIN_FILENO);
-                } else {                                                 // middle
-                    if (i-1 == k) {
-                        close(pipefd[k][1]);
-                        dup2(pipefd[k][0], STDIN_FILENO);
-                    } else if (i == k) {
-                        close(pipefd[k][0]);
-                        dup2(pipefd[k][1], STDOUT_FILENO);
-                    } else {
-                        close(pipefd[k][0]);
-                        close(pipefd[k][1]);
-                    }
+                } else if ((i == 0 && k == 0) || i == k) {
+                    close(pipefd[k][0]);
+                    dup2(pipefd[k][1], STDOUT_FILENO);
+                } else {
+                    close(pipefd[k][0]);
+                    close(pipefd[k][1]);
                 }
             }
             
-            // Print the command 
-            // printf("Child: Executing command: %s\n", commands[i]);
             // Execute the command
             execute_command(commands[i]);
-        } else {
-            // Parent process
-            // printf("Parent process: %d\n", getpid());
+        } else {    // Parent process
             signal(SIGINT, SIG_IGN);
             child_pids[i] = pid;
         }
         // here, the parent process will continue to fork the next child process
     }
 
-    // Send SIGUSR1 to wake up child processes when ready
-    // sleep(0.85); // Sleep for a moment to ensure child process is ready to catch the signal
+    // Send SIGUSR1 to wake up child processes
     for (int i = 0; i < num_commands; i++) {
         // printf("Parent: sending SIGUSR1 to child process %d\n", child_pids[i]);
         kill(child_pids[i], SIGUSR1);
@@ -282,42 +271,47 @@ void execute_job(char *commands[], int num_commands) {
     }
 
     // Wait for all child processes to terminate
-    siginfo_t si[num_commands];
+    siginfo_t si[num_commands]; // array of siginfo_t
     for (int i = 0; i < num_commands; i++) {
         waitid(P_PID, child_pids[i], &si[i], WNOWAIT | WEXITED);
     }
 
+    extract_stat(num_commands, child_pids, si);
+}
+
+/* Function to extract and print the stat, and remove process zombie state */
+void extract_stat(int num_commands, pid_t child_pids[], siginfo_t si[]) {
+
     // a struct array to store the stats
-    struct process_stat stat_arr[num_commands];
+    ProcessStat stat_arr[num_commands];
     for (int i = 0; i < num_commands; i++) {
-        stat_arr[i] = get_process_statistics(child_pids[i], si[i]);
+        stat_arr[i] = get_process_stat(child_pids[i], si[i]);
 
         // Clear the zombie status and extract status and 
         int status;
         waitpid(child_pids[i], &status, 0);
         stat_arr[i].excode = WEXITSTATUS(status);   // (why doesn't match with /proc/<pid>/stat field 52?)
         if (WIFSIGNALED(status)){
-            // printf("-----> Child process %d terminated by signal %d\n", child_pids[i], WTERMSIG(status));
             stat_arr[i].termBySig = true;
         } else { stat_arr[i].termBySig = false; }
-
     }
 
     // Sort stat_arr by total_time
     for (int j = 0; j < num_commands; j++) {
         for (int k = j+1; k < num_commands; k++) {
             if (stat_arr[j].total_time > stat_arr[k].total_time) {
-                struct process_stat temp = stat_arr[j];
+                ProcessStat temp = stat_arr[j];
                 stat_arr[j] = stat_arr[k];
                 stat_arr[k] = temp;
             }
         }
     }   // bubble sort
 
-    // print stats in termination order
+    // Print stats in termination order
     printf("\n");
     for (int i = 0; i < num_commands; i++) {
-        if (stat_arr[i].termBySig) {    // process is terminated by signal
+        // Print EXSIG if the process is terminated by signal, otherwise print EXCODE
+        if (stat_arr[i].termBySig) {    // Process is terminated by signal
             printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
         } else {
             printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
@@ -326,42 +320,71 @@ void execute_job(char *commands[], int num_commands) {
     }
 }
 
-// Return error codes or messages:
-// 0: Valid input
-// 1: Empty input
-// 2: Two consecutive pipes
-// 3: Pipe at the beginning
-// 4: Pipe at the end
-int validate_input(const char *input) {
-    int input_length = strlen(input);
+/* Return error codes and messages:
+    0: Valid input
+    1: Exit
+    2: Exit with other args
+    3: Empty input
+    4: Two consecutive pipes
+    5: Pipe at the beginning
+    6: Pipe at the end */ 
+int validate_input(const char *input, int input_length) {
 
+    // make a copy for input (to facilitate tokenization)
+    char input_copy[MAX_COMMAND_LENGTH];
+    strcpy(input_copy, input);
+
+    // Tokenize the input by space
+    char* token = strtok(input_copy, " ");
+    // Check if the user wants to exit
+    if (token != NULL && strcmp(token, "exit") == 0) {
+        // Check for additional arguments from input
+        token = strtok(NULL, " ");
+        if (token != NULL) {
+            // User entered "exit" with additional arguments
+            fprintf(stderr, "JCshell: 'exit' with other arguments!!!\n");
+            return 2;
+        } else {
+            // User only entered "exit"
+            printf("JCshell: Terminated\n");
+            return 1;
+        }
+    }
+
+    // Check for empty input
     if (input_length == 0 || strspn(input, " ") == input_length) {
         // if input is empty or only spaces
-        return 1;
-    } else {
-        int consecutive_pipe = 0;
-        for (int i = 0; i < input_length; i++) {
-            if (input[i] == '|') {
-                consecutive_pipe++;
-                if (consecutive_pipe == 2) {
-                    return 2;  // Two consecutive pipes
-                }
-            } else if (input[i] == ' ') {
-                continue;
-            } else {
-                consecutive_pipe = 0;
+        // fprintf(stderr, "JCshell: should not have empty input\n");
+        return 3;
+    }
+
+    // Check for pipe syntax
+    int consecutive_pipe = 0;
+    for (int i = 0; i < input_length; i++) {
+        if (input[i] == '|') {
+            consecutive_pipe++;
+            if (consecutive_pipe == 2) {
+                fprintf(stderr, "JCshell: should not have two | symbols without in-between command\n");
+                return 4;  // Two consecutive pipes
             }
+        } else if (input[i] == ' ') {
+            continue;
+        } else {
+            consecutive_pipe = 0;
         }
     }
     if (input[0] == '|') {
-        return 3;  // Pipe at the beginning
+        fprintf(stderr, "JCshell: should not have a | symbol at the beginning of the command\n");
+        return 5;  // Pipe at the beginning
     } else if (input[strlen(input) - 1] == '|') {
-        return 4;  // Pipe at the end
+        fprintf(stderr, "JCshell: should not have a | symbol at the end of the command\n");
+        return 6;  // Pipe at the end
     }
+
+    // printf("JCshell: Valid input\n");
     return 0;  // Valid input
 }
 
-// utility funcitons
 void print_cmds(char * arr[], int size) {
     printf("Printing `commands`-> ");
     for (int i = 0; i < size; i++) {
@@ -389,49 +412,22 @@ int main() {
         int input_length = (int)strcspn(input, "\n");
         input[input_length] = '\0';
 
-        // make a copy for input (to facilitate tokenization)
-        char input_copy[MAX_COMMAND_LENGTH];
-        strcpy(input_copy, input);
-        // Tokenize the input by space
-        char* token = strtok(input_copy, " ");  // returns the pointer to the first token encountered in the string
-        // Check if the user wants to exit
-        if (token != NULL && strcmp(token, "exit") == 0) {
-            // Check for additional arguments from input
-            token = strtok(NULL, " ");
-            if (token != NULL) {
-                // User entered "exit" with additional arguments
-                fprintf(stderr, "JCshell: 'exit' with other arguments!!!\n");
-                continue;
-            } else {
-                // User only entered "exit"
-                break;
-            }
-        }
-
-        // Validate input for consecutive pipes and pipes at the beginning or end
-        int error_code = validate_input(input);
-        if (error_code == 1) {
-            // fprintf(stderr, "JCshell: should not have empty input\n");
-            continue;
-        } else if (error_code == 2) {
-            fprintf(stderr, "JCshell: should not have two | symbols without in-between command\n");
-            continue;
-        } else if (error_code == 3) {
-            fprintf(stderr, "JCshell: should not have a | symbol at the beginning of the command\n");
-            continue;
-        } else if (error_code == 4) {
-            fprintf(stderr, "JCshell: should not have a | symbol at the end of the command\n");
-            continue;
+        // Validate input to check for exit command and pipe syntax
+        int error_code = validate_input(input, input_length);
+        if (!error_code){
+            // Valid input, execute the job
+        } else if (error_code == 1) {
+            break;    // Exit
+        } else {
+            continue; // Prompt for next input
         }
 
         // Tokenize the input into commands separated by pipes
         char *commands[MAX_COMMANDS];       // array of commands 
         int num_commands = 0;
 
-        token = strtok(input, "|");
-        // printf("token: %s\n", token);
+        char* token = strtok(input, "|");
         while (token != NULL) {
-            // printf("Command: %s\n", token);
             commands[num_commands++] = token;
             token = strtok(NULL, "|");
         }
