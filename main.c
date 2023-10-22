@@ -20,13 +20,11 @@ struct process_stat {
     int excode;
     char exsig[256];
     int ppid;
-    unsigned long user;
-    unsigned long sys;
-    // double user;
-    // double sys;
+    double user;
+    double sys;
     unsigned long vctx;
     unsigned long nvctx;
-    long long total_time;
+    double total_time;
     bool termBySig;
 };
 
@@ -77,11 +75,8 @@ struct process_stat get_process_statistics(pid_t pid, siginfo_t si) {
     int extracted_pid;
     char cmd[256], state, exsig[256];  // exsig is the string representation of si.si_status
     int excode, ppid;
-    unsigned long user, sys;
-    long cutime, cstime;
-    // double user, sys, cutime, cstime, start_time, total_time;
+    double user, sys, cutime, cstime, start_time, total_time;
     unsigned long vctx, nvctx;
-    unsigned long long start_time, total_time;
 
     // Construct the file paths for the stat and status files
     snprintf(stat_filepath, sizeof(stat_filepath), "/proc/%d/stat", pid);
@@ -121,20 +116,15 @@ struct process_stat get_process_statistics(pid_t pid, siginfo_t si) {
         } else if (field == 52) {
             excode = atoi(token);
         } else if (field == 14) {
-            user = atol(token);
-            // double user_ = atof(token) / sysconf(_SC_CLK_TCK);
+            user = atof(token) / sysconf(_SC_CLK_TCK);
         } else if (field == 15) {
-            sys = atol(token);
-            // sys = atof(token) / sysconf(_SC_CLK_TCK);
+            sys = atof(token) / sysconf(_SC_CLK_TCK);
         } else if (field == 16) {
-            cutime = atol(token);
-            // cutime = atof(token) / sysconf(_SC_CLK_TCK);
+            cutime = atof(token) / sysconf(_SC_CLK_TCK);
         } else if (field == 17) {
-            cstime = atol(token);
-            // cstime = atof(token) / sysconf(_SC_CLK_TCK);
+            cstime = atof(token) / sysconf(_SC_CLK_TCK);
         } else if (field == 22) {
-            start_time = atol(token);
-            // start_time = atof(token) / sysconf(_SC_CLK_TCK);
+            start_time = atof(token) / sysconf(_SC_CLK_TCK);
         }
         token = strtok(NULL, " ");
         field++;
@@ -176,7 +166,6 @@ struct process_stat get_process_statistics(pid_t pid, siginfo_t si) {
 
     // total_time: termination time of the process
     total_time = start_time + user + sys + cutime + cstime;
-    // printf("total_time: %lld, start_time: %lld, user: %lu, sys: %lu, cutime: %lu, cstime: %lu\n", total_time, start_time, user, sys, cutime, cstime);
     // printf("total_time: %f, start_time: %f, user: %f, sys: %f, cutime: %f, cstime: %f\n", total_time, start_time, user, sys, cutime, cstime);
     char * signal_name = strsignal(si.si_status);
     // store signal name in exsig
@@ -196,6 +185,8 @@ void execute_job(char *commands[], int num_commands) {
     int pipefd[MAX_COMMANDS - 1][2];
     int num_pipefds = num_commands - 1;
 
+    sigset_t orig_mask;
+
     // printf("num_commands: %d\n", num_commands);
 
     // Create pipes for inter-process communication
@@ -211,6 +202,15 @@ void execute_job(char *commands[], int num_commands) {
 
     // Fork child processes for each command
     for (int i = 0; i < num_commands; i++) {    // i: command index
+        signal(SIGUSR1, sigusr1_handler);
+
+        sigset_t set;
+        // Initialize a signal set containing SIGUSR1
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        // Block the signals in the set (prevent the signal from being delivered to the process)
+        sigprocmask(SIG_BLOCK, &set, &orig_mask);
+        
         // printf("Ready to fork child process: %d\n", getpid());
         pid_t pid = fork();
 
@@ -219,35 +219,16 @@ void execute_job(char *commands[], int num_commands) {
             exit(1);
         } else if (pid == 0) {
             // Child process
-            // printf("Child process: %d\n", getpid());
+            // printf("Child: process: %d\n", getpid());
 
-            sigset_t set;
-            int sig;
-            // Initialize a signal set containing SIGUSR1
-            sigemptyset(&set);
-            sigaddset(&set, SIGUSR1);
-            // Block the signals in the set (prevent the signal from being delivered to the process)
-            sigprocmask(SIG_BLOCK, &set, NULL);
+            sigset_t empty_mask;
+            sigemptyset(&empty_mask);
 
-            // Set the handler for SIGUSR1
-            struct sigaction sa;
-            sigaction(SIGUSR1, NULL, &sa);
-            sa.sa_handler = sigusr1_handler;
-            sigaction(SIGUSR1, &sa, NULL);
+            // Wait for the signal using sigsuspend
+            sigsuspend(&empty_mask);
 
-            // Wait for SIGUSR1 to be received
-            // printf("Waiting for SIGUSR1...\n");
-            if (sigwait(&set, &sig) == -1) {
-                perror("sigwait");
-                exit(EXIT_FAILURE);
-            }
-
-            // Install the SIGINT handler
-            // struct sigaction sa;
-            // sigaction(SIGINT, NULL, &sa);
-            // sa.sa_handler = SIG_DFL;
-            // sigaction(SIGINT, &sa, NULL);
-            signal(SIGINT, SIG_DFL);
+            // Unblock SIGUSR1 for the child process
+            sigprocmask(SIG_SETMASK, &orig_mask, NULL);
 
 
             for (int k = 0; k < num_pipefds; k++) { // k: pipefd index
@@ -275,7 +256,7 @@ void execute_job(char *commands[], int num_commands) {
             }
             
             // Print the command 
-            // printf("Executing command: %s\n", commands[i]);
+            // printf("Child: Executing command: %s\n", commands[i]);
             // Execute the command
             execute_command(commands[i]);
         } else {
@@ -288,9 +269,9 @@ void execute_job(char *commands[], int num_commands) {
     }
 
     // Send SIGUSR1 to wake up child processes when ready
-    sleep(0.85);
+    // sleep(0.85); // Sleep for a moment to ensure child process is ready to catch the signal
     for (int i = 0; i < num_commands; i++) {
-        // printf("Sending SIGUSR1 to child process %d\n", child_pids[i]);
+        // printf("Parent: sending SIGUSR1 to child process %d\n", child_pids[i]);
         kill(child_pids[i], SIGUSR1);
     }
 
@@ -337,13 +318,11 @@ void execute_job(char *commands[], int num_commands) {
     printf("\n");
     for (int i = 0; i < num_commands; i++) {
         if (stat_arr[i].termBySig) {    // process is terminated by signal
-            // printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%f (SYS)%f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
-            printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%lu (SYS)%lu (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
+            printf("(PID)%d (CMD)%s (STATE)%c (EXSIG)%s (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
         } else {
-            // printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%f (SYS)%f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
-            printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%lu (SYS)%lu (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
+            printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx);
         }
-        // printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (EXSIG)%s (PPID)%d (USER)%lu (SYS)%lu (VCTX)%lu (NVCTX)%lu (Total_ime)%lld (termBySig)%d\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx, stat_arr[i].total_time, stat_arr[i].termBySig);
+        // printf("(PID)%d (CMD)%s (STATE)%c (EXCODE)%d (EXSIG)%s (PPID)%d (USER)%.2f (SYS)%.2f (VCTX)%lu (NVCTX)%lu (Total_ime)%f (termBySig)%d\n", stat_arr[i].pid, stat_arr[i].cmd, stat_arr[i].state, stat_arr[i].excode, stat_arr[i].exsig, stat_arr[i].ppid, stat_arr[i].user, stat_arr[i].sys, stat_arr[i].vctx, stat_arr[i].nvctx, stat_arr[i].total_time, stat_arr[i].termBySig);
     }
 }
 
@@ -354,12 +333,27 @@ void execute_job(char *commands[], int num_commands) {
 // 3: Pipe at the beginning
 // 4: Pipe at the end
 int validate_input(const char *input) {
-    if (strlen(input) == 0 || strspn(input, " ") == strlen(input)) {
+    int input_length = strlen(input);
+
+    if (input_length == 0 || strspn(input, " ") == input_length) {
         // if input is empty or only spaces
         return 1;
-    } else if (strstr(input, "||") != NULL) {
-        return 2;  // Two consecutive pipes
-    } else if (input[0] == '|') {
+    } else {
+        int consecutive_pipe = 0;
+        for (int i = 0; i < input_length; i++) {
+            if (input[i] == '|') {
+                consecutive_pipe++;
+                if (consecutive_pipe == 2) {
+                    return 2;  // Two consecutive pipes
+                }
+            } else if (input[i] == ' ') {
+                continue;
+            } else {
+                consecutive_pipe = 0;
+            }
+        }
+    }
+    if (input[0] == '|') {
         return 3;  // Pipe at the beginning
     } else if (input[strlen(input) - 1] == '|') {
         return 4;  // Pipe at the end
@@ -379,13 +373,8 @@ void print_cmds(char * arr[], int size) {
 int main() {
     char input[MAX_COMMAND_LENGTH];
 
-    // Install the SIGINT handler
-    // struct sigaction sa;
-    // sigaction(SIGINT, NULL, &sa);
-    // sa.sa_handler = sigint_handler1;
-    // sigaction(SIGINT, &sa, NULL);
-
     while (1) {
+        // Install the SIGINT handler
         signal(SIGINT, sigint_handler1);
 
         // Print shell prompt with process ID
